@@ -9,6 +9,8 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/stretchr/testify/require"
 
+	"github.com/hashicorp/consul/lib/ttlcache"
+
 	"github.com/hashicorp/consul/agent/cache"
 	"github.com/hashicorp/consul/proto/pbcommon"
 	"github.com/hashicorp/consul/proto/pbservice"
@@ -19,7 +21,7 @@ func TestStore_Get(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	store := NewStore()
+	store := NewStore(hclog.New(nil))
 	go store.Run(ctx)
 
 	req := &fakeRequest{
@@ -203,14 +205,43 @@ func (f *fakeView) Reset() {
 	f.srvs = make(map[string]*pbservice.CheckServiceNode)
 }
 
-// TODO: Get with Notify
-
 func TestStore_Notify(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	store := NewStore(hclog.New(nil))
+	go store.Run(ctx)
+
+	req := &fakeRequest{
+		client: NewTestStreamingClient(pbcommon.DefaultEnterpriseMeta.Namespace),
+	}
+	req.client.QueueEvents(
+		newEndOfSnapshotEvent(2),
+		newEventServiceHealthRegister(10, 1, "srv1"),
+		newEventServiceHealthRegister(22, 2, "srv1"))
+
+	cID := "correlate"
+	ch := make(chan cache.UpdateEvent)
+
+	err := store.Notify(ctx, req, cID, ch)
+	require.NoError(t, err)
+
+	runStep(t, "from empty store, starts materializer", func(t *testing.T) {
+		store.lock.Lock()
+		defer store.lock.Unlock()
+		require.Len(t, store.byKey, 1)
+		e := store.byKey[makeEntryKey(req.Type(), req.CacheInfo())]
+		require.Equal(t, ttlcache.NotIndexed, e.expiry.Index())
+		require.Equal(t, 1, e.requests)
+	})
+
 	// TODO: Notify with no existing entry
 	// TODO: Notify with Get
 	// TODO: Notify multiple times same key
 	// TODO: Notify no update if index is not past MinIndex.
 }
+
+// TODO: TestStore_GetWithNotify
 
 func runStep(t *testing.T, name string, fn func(t *testing.T)) {
 	t.Helper()
